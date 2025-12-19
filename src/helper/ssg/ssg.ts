@@ -77,6 +77,40 @@ const parseResponseContent = async (response: Response): Promise<string | ArrayB
   }
 }
 
+/**
+ * Resolve Suspense placeholders in static HTML output by replacing
+ * `<template id="H:n"></template>...<!--/$-->` occurrences with the
+ * content from `<template data-hono-target="H:n">...</template>`.
+ */
+const resolveSuspenseInHTML = (html: string): string => {
+  const targetMap = new Map<string, string>()
+  const appendedBlockRe =
+    /<template[^>]*data-hono-target="H:(\d+)"[^>]*>([\s\S]*?)<\/template\s*>\s*<script[^>]*>[\s\S]*?<\/script>/g
+  const withoutAppended = html.replace(appendedBlockRe, (_all, id: string, content: string) => {
+    targetMap.set(id, content)
+    return ''
+  })
+
+  if (targetMap.size === 0) return html
+
+  const placeholderReSource = '<template id="H:(\\d+)"><\\/template>[\\s\\S]*?<!--\\/\\$-->'
+
+  const replaceOnce = (input: string) =>
+    input.replace(
+      new RegExp(placeholderReSource, 'g'),
+      (all, id: string) => targetMap.get(id) ?? all
+    )
+
+  const resolveUntilStable = (input: string, remaining: number): string =>
+    remaining <= 0
+      ? input
+      : ((next) => (next === input ? input : resolveUntilStable(next, remaining - 1)))(
+          replaceOnce(input)
+        )
+
+  return resolveUntilStable(withoutAppended, targetMap.size)
+}
+
 export const defaultExtensionMap: Record<string, string> = {
   'text/html': 'html',
   'text/xml': 'xml',
@@ -269,7 +303,10 @@ export const fetchRoutesContent = function* <
                   }
                   const mimeType =
                     response.headers.get('Content-Type')?.split(';')[0] || DEFAULT_CONTENT_TYPE
-                  const content = await parseResponseContent(response)
+                  let content = await parseResponseContent(response)
+                  if (typeof content === 'string' && mimeType === 'text/html') {
+                    content = resolveSuspenseInHTML(content)
+                  }
                   resolveReq({
                     routePath: replacedUrlParam,
                     mimeType,

@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 /** @jsxImportSource ../../jsx */
 import { Hono } from '../../hono'
+import { renderToReadableStream, StreamingContext, Suspense } from '../../jsx/streaming'
 import { poweredBy } from '../../middleware/powered-by'
 import {
   X_HONO_DISABLE_SSG_HEADER_KEY,
@@ -314,6 +315,216 @@ describe('toSSG function', () => {
     })
 
     expect(signalAddEventListener).not.toHaveBeenCalled()
+  })
+
+  it('should resolve Suspense components during SSG', async () => {
+    const writtenFiles: Record<string, string> = {}
+    const fsMock: FileSystemModule = {
+      writeFile: (path, data) => {
+        writtenFiles[path] = typeof data === 'string' ? data : data.toString()
+        return Promise.resolve()
+      },
+      mkdir: vi.fn(() => Promise.resolve()),
+    }
+
+    const app = new Hono()
+
+    const Component = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      return (
+        <ul>
+          <li>
+            <a href='/shops/yoshimuraya'>yoshimuraya</a>
+          </li>
+          <li>
+            <a href='/shops/sugitaya'>sugitaya</a>
+          </li>
+          <li>
+            <a href='/shops/takasagoya'>takasagoya</a>
+          </li>
+        </ul>
+      )
+    }
+
+    app.get('/shops', (c) => {
+      const stream = renderToReadableStream(
+        <html>
+          <body>
+            <Suspense fallback={<div>loading...</div>}>
+              <Component />
+            </Suspense>
+          </body>
+        </html>
+      )
+      return c.body(stream, {
+        headers: {
+          'Content-Type': 'text/html; charset=UTF-8',
+          'Transfer-Encoding': 'chunked',
+        },
+      })
+    })
+
+    const rawRes = await app.request('/shops')
+    const rawHtml = await rawRes.text()
+    expect(rawHtml).toContain('loading...')
+    expect(rawHtml).toMatch(/<template[^>]*id="H:\d+"/)
+    expect(rawHtml).toContain('<!--/$-->')
+
+    await toSSG(app, fsMock)
+    const html = writtenFiles[`static/shops.html`]
+    expect(html).not.toContain('loading...')
+    expect(html).toContain('<ul>')
+    expect(html).toContain('<li>')
+    expect(html).toContain('<a href="/shops/yoshimuraya">yoshimuraya</a>')
+    expect(html).not.toMatch(/<template[^>]*id="H:\\d+"/)
+    expect(html).not.toContain('<!--/$-->')
+  })
+
+  it('should resolve nested and multiple Suspense components during SSG', async () => {
+    const writtenFiles: Record<string, string> = {}
+    const fsMock: FileSystemModule = {
+      writeFile: (path, data) => {
+        writtenFiles[path] = typeof data === 'string' ? data : data.toString()
+        return Promise.resolve()
+      },
+      mkdir: vi.fn(() => Promise.resolve()),
+    }
+
+    const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+    const Inner = async () => {
+      await wait(30)
+      return <span data-test='inner'>INNER</span>
+    }
+
+    const OuterList = async () => {
+      await wait(60)
+      return (
+        <ol>
+          <li>ONE</li>
+          <li>TWO</li>
+        </ol>
+      )
+    }
+
+    const Sibling = async () => {
+      await wait(10)
+      return <div id='sibling'>SIBLING</div>
+    }
+
+    const app = new Hono()
+    app.get('/complex-shops', (c) => {
+      const stream = renderToReadableStream(
+        <html>
+          <body>
+            <div id='root'>
+              <Suspense fallback={<p>outer loading</p>}>
+                <h1>Title</h1>
+                <Suspense fallback={<span>inner loading</span>}>
+                  <Inner />
+                </Suspense>
+                <OuterList />
+              </Suspense>
+              <Suspense fallback={'sibling loading'}>
+                <Sibling />
+              </Suspense>
+            </div>
+          </body>
+        </html>
+      )
+      return c.body(stream, {
+        headers: {
+          'Content-Type': 'text/html; charset=UTF-8',
+          'Transfer-Encoding': 'chunked',
+        },
+      })
+    })
+
+    const rawRes = await app.request('/complex-shops')
+    const rawHtml = await rawRes.text()
+    expect(rawHtml).toContain('outer loading')
+    expect(rawHtml).toContain('inner loading')
+    expect(rawHtml).toContain('sibling loading')
+    expect(rawHtml).toMatch(/<template[^>]*id="H:\d+"/)
+    expect(rawHtml).toContain('<!--/$-->')
+    expect(rawHtml).toMatch(/data-hono-target="H:\d+"/)
+
+    await toSSG(app, fsMock)
+    const html = writtenFiles[`static/complex-shops.html`]
+
+    expect(html).toContain('<div id="root">')
+    expect(html).toContain('<h1>Title</h1>')
+    expect(html).toContain('<span data-test="inner">INNER</span>')
+    expect(html).toContain('<ol>')
+    expect(html).toContain('<li>ONE</li>')
+    expect(html).toContain('<li>TWO</li>')
+    expect(html).toContain('<div id="sibling">SIBLING</div>')
+
+    expect(html).not.toContain('outer loading')
+    expect(html).not.toContain('inner loading')
+    expect(html).not.toContain('sibling loading')
+    expect(html).not.toMatch(/<template[^>]*id="H:\d+"/)
+    expect(html).not.toContain('<!--/$-->')
+    expect(html).not.toMatch(/data-hono-target="H:\d+"/)
+  })
+
+  it('should resolve Suspense and remove nonce-bearing StreamingContext scripts during SSG', async () => {
+    const writtenFiles: Record<string, string> = {}
+    const fsMock: FileSystemModule = {
+      writeFile: (path, data) => {
+        writtenFiles[path] = typeof data === 'string' ? data : data.toString()
+        return Promise.resolve()
+      },
+      mkdir: vi.fn(() => Promise.resolve()),
+    }
+
+    const app = new Hono()
+    const nonce = 'random-nonce-value'
+
+    const AsyncComponent = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return <div id='async'>OK</div>
+    }
+
+    app.get('/', (c) => {
+      const stream = renderToReadableStream(
+        <html>
+          <body>
+            <StreamingContext value={{ scriptNonce: nonce }}>
+              <Suspense fallback={<div>Loading...</div>}>
+                <AsyncComponent />
+              </Suspense>
+            </StreamingContext>
+          </body>
+        </html>
+      )
+
+      return c.body(stream, {
+        headers: {
+          'Content-Type': 'text/html; charset=UTF-8',
+          'Transfer-Encoding': 'chunked',
+          'Content-Security-Policy': `script-src 'nonce-${nonce}'`,
+        },
+      })
+    })
+
+    const rawRes = await app.request('/')
+    const rawHtml = await rawRes.text()
+    expect(rawHtml).toContain('Loading...')
+    expect(rawHtml).toMatch(/<template[^>]*id="H:\d+"/)
+    expect(rawHtml).toContain('<!--/$-->')
+    expect(rawHtml).toMatch(/data-hono-target="H:\d+"/)
+    expect(rawHtml).toContain(`nonce="${nonce}"`)
+
+    await toSSG(app, fsMock)
+    const html = writtenFiles['static/index.html']
+
+    expect(html).toContain('<div id="async">OK</div>')
+    expect(html).not.toContain('Loading...')
+    expect(html).not.toMatch(/<template[^>]*id="H:\d+"/)
+    expect(html).not.toContain('<!--/$-->')
+    expect(html).not.toMatch(/data-hono-target="H:\d+"/)
+    expect(html).not.toContain(`nonce="${nonce}"`)
   })
 })
 
